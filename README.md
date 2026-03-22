@@ -80,10 +80,6 @@ Spans use [OpenInference semantic conventions](https://github.com/Arize-ai/openi
 - OTEL exports use `Authorization: Bearer <key>` for the OTLP endpoint (not `api_key` header)
 - The plugin initializes OTEL during `register()` to ensure hooks can create spans immediately
 
-## Credits
-
-Forked from [@opik/opik-openclaw](https://github.com/comet-ml/opik-openclaw), adapted for Phoenix Cloud with OpenInference conventions.
-
 ## License
 
 Apache-2.0
