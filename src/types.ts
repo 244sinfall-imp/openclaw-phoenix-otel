@@ -79,4 +79,6 @@ export type ActiveTrace = {
     durationMs?: number;
     messages: unknown[];
   };
+  agentId?: string;
+  userId?: string;
 };
