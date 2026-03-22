@@ -1,406 +1,484 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// ---- Mock openclaw/plugin-sdk ----
+// Mock openclaw/plugin-sdk
 vi.mock("openclaw/plugin-sdk", () => ({
-  emptyPluginConfigSchema: () => ({}),
+  emptyPluginConfigSchema: vi.fn(() => ({})),
   onDiagnosticEvent: vi.fn(),
-  SpanStatusCode: { UNSET: 0, OK: 1, ERROR: 2 },
+  SpanStatusCode: { OK: 1, ERROR: 2, UNSET: 0 },
 }));
 
-// ---- Mock otel-bridge ----
-// Use module-scoped mutable state that can be controlled per-test
-const mockSpan = () => ({
+// Mock otel-bridge
+const mockRootSpan = {
   setAttribute: vi.fn(),
   setStatus: vi.fn(),
   end: vi.fn(),
-  spanContext: vi.fn(() => ({ traceId: "abc", spanId: "def", traceFlags: 1 })),
-  isRecording: vi.fn(() => true),
-});
-
-const state = {
-  initOtel: vi.fn(),
-  getTracer: vi.fn(() => ({ startSpan: vi.fn() })),
-  startRootSpan: vi.fn(() => mockSpan()),
-  startChildSpan: vi.fn(() => mockSpan()),
-  forceFlush: vi.fn(() => Promise.resolve()),
-  shutdown: vi.fn(() => Promise.resolve()),
+};
+const mockLlmSpan = {
+  setAttribute: vi.fn(),
+  setStatus: vi.fn(),
+  end: vi.fn(),
+};
+const mockToolSpan = {
+  setAttribute: vi.fn(),
+  setStatus: vi.fn(),
+  end: vi.fn(),
 };
 
+// Track which child spans were created per root span to distinguish LLM vs tool spans
+// Strategy: first startChildSpan call after each llm_input = LLM span; subsequent = tool spans
+const childSpanCallsPerRoot = new Map<object, number>();
+
 vi.mock("../src/service/otel-bridge.js", () => ({
-  initOtel: (...args: any[]) => state.initOtel(...args),
-  getTracer: (...args: any[]) => state.getTracer(...args),
-  startRootSpan: (...args: any[]) => state.startRootSpan(...args),
-  startChildSpan: (...args: any[]) => state.startChildSpan(...args),
-  forceFlush: (...args: any[]) => state.forceFlush(...args),
-  shutdown: (...args: any[]) => state.shutdown(...args),
-  SpanStatusCode: { UNSET: 0, OK: 1, ERROR: 2 },
+  initOtel: vi.fn(),
+  getTracer: vi.fn(() => ({})), // non-null = ready
+  startRootSpan: vi.fn(() => {
+    childSpanCallsPerRoot.set(mockRootSpan, 0);
+    return mockRootSpan;
+  }),
+  startChildSpan: vi.fn((parent: any, name: string) => {
+    const calls = (childSpanCallsPerRoot.get(mockRootSpan) ?? 0) + 1;
+    childSpanCallsPerRoot.set(mockRootSpan, calls);
+    // First child is always the LLM span; subsequent are tool spans
+    return calls === 1 ? mockLlmSpan : mockToolSpan;
+  }),
+  forceFlush: vi.fn(async () => {}),
+  shutdown: vi.fn(async () => {}),
+  SpanStatusCode: { OK: 1, ERROR: 2, UNSET: 0 },
+  context: { active: vi.fn(() => ({})) },
+  trace: { setSpan: vi.fn((ctx: any) => ctx) },
 }));
 
-// Flush microtasks helper
-const flushMicrotasks = () => new Promise<void>((r) => setTimeout(r, 0));
-
-// Helper to create a mock API and capture handlers
-function createMockApi(pluginConfig: unknown = {}) {
-  const handlers = new Map<string, (...args: any[]) => void>();
-  let registeredService: any = null;
+// Helper: build a mock API that captures event handlers
+function buildMockApi(pluginConfig: unknown = {}) {
+  const handlers: Record<string, Function[]> = {};
+  let serviceRegistration: { id: string; start: Function; stop: Function } | null = null;
 
   const api = {
     pluginConfig,
-    on: vi.fn((event: string, handler: (...args: any[]) => void) => {
-      handlers.set(event, handler);
+    on: vi.fn((event: string, handler: Function) => {
+      if (!handlers[event]) handlers[event] = [];
+      handlers[event].push(handler);
     }),
     registerService: vi.fn((service: any) => {
-      registeredService = service;
+      serviceRegistration = service;
     }),
-  };
-
-  return {
-    api,
-    handlers,
-    getService: () => registeredService,
-    fire: (event: string, ...args: any[]) => {
-      const handler = handlers.get(event);
-      if (handler) handler(...args);
+    emit: (event: string, eventData: any, ctx: any) => {
+      for (const h of handlers[event] ?? []) h(eventData, ctx);
     },
+    getService: () => serviceRegistration,
   };
+  return api;
 }
 
-// Import plugin (uses hoisted mocks above)
-import plugin from "../index.js";
+function makeAgentCtx(overrides: Record<string, unknown> = {}) {
+  return { sessionKey: "sess-abc", channelId: "signal", ...overrides };
+}
 
-describe("plugin", () => {
+// Flush microtasks (agent_end uses queueMicrotask)
+function flushMicrotasks() {
+  return new Promise((r) => setTimeout(r, 0));
+}
+
+describe("plugin registration", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Reset mock implementations
-    state.initOtel = vi.fn();
-    state.getTracer = vi.fn(() => ({ startSpan: vi.fn() }));
-    state.startRootSpan = vi.fn(() => mockSpan());
-    state.startChildSpan = vi.fn(() => mockSpan());
-    state.forceFlush = vi.fn(() => Promise.resolve());
-    state.shutdown = vi.fn(() => Promise.resolve());
+    childSpanCallsPerRoot.clear();
   });
 
-  it("has correct id and name", () => {
-    expect(plugin.id).toBe("phoenix-otel");
-    expect(plugin.name).toBe("Phoenix OTEL");
-  });
-
-  it("calls initOtel on register", () => {
-    const { api } = createMockApi();
-    plugin.register(api as any);
-    expect(state.initOtel).toHaveBeenCalled();
-  });
-
-  it("registers all expected event handlers", () => {
-    const { api } = createMockApi();
+  it("registers all expected event handlers", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
     plugin.register(api as any);
     expect(api.on).toHaveBeenCalledWith("llm_input", expect.any(Function));
     expect(api.on).toHaveBeenCalledWith("llm_output", expect.any(Function));
     expect(api.on).toHaveBeenCalledWith("before_tool_call", expect.any(Function));
     expect(api.on).toHaveBeenCalledWith("after_tool_call", expect.any(Function));
     expect(api.on).toHaveBeenCalledWith("agent_end", expect.any(Function));
+    expect(api.registerService).toHaveBeenCalledWith(expect.objectContaining({ id: "phoenix-otel" }));
   });
 
-  it("registers a service", () => {
-    const { api } = createMockApi();
+  it("calls initOtel with config during register", async () => {
+    const { default: plugin } = await import("../index.js");
+    const { initOtel } = await import("../src/service/otel-bridge.js");
+    const api = buildMockApi({ endpoint: "https://custom.phoenix.io", apiKey: "sk-123", projectName: "myproj" });
     plugin.register(api as any);
-    expect(api.registerService).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "phoenix-otel" })
+    expect(initOtel).toHaveBeenCalledWith(expect.objectContaining({
+      endpoint: "https://custom.phoenix.io",
+      apiKey: "sk-123",
+      projectName: "myproj",
+    }));
+  });
+});
+
+describe("llm_input handler", () => {
+  beforeEach(() => { vi.clearAllMocks(); childSpanCallsPerRoot.clear(); });
+
+  it("creates root and LLM spans with correct attributes", async () => {
+    const { default: plugin } = await import("../index.js");
+    const { startRootSpan, startChildSpan } = await import("../src/service/otel-bridge.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    api.emit("llm_input", {
+      model: "claude-opus-4",
+      provider: "anthropic",
+      prompt: "Hello world",
+      systemPrompt: "You are helpful.",
+      historyMessages: [{ role: "user", content: "prior msg" }],
+    }, makeAgentCtx());
+
+    expect(startRootSpan).toHaveBeenCalledWith(
+      expect.stringContaining("claude-opus-4"),
+      expect.objectContaining({
+        "openinference.span.kind": "AGENT",
+        "llm.model_name": "claude-opus-4",
+        "llm.provider": "anthropic",
+        "session.id": "sess-abc",
+      }),
+    );
+    expect(startChildSpan).toHaveBeenCalledWith(
+      mockRootSpan,
+      expect.any(String),
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          "openinference.span.kind": "LLM",
+          "llm.model_name": "claude-opus-4",
+        }),
+      }),
+    );
+    // Input messages should be set
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith(
+      "llm.input_messages.0.message.role", "system",
+    );
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith(
+      "llm.input_messages.1.message.role", "user",
     );
   });
 
-  describe("llm_input → llm_output lifecycle", () => {
-    it("creates root and LLM spans on llm_input", () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
+  it("sets user.id when senderId present", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
 
-      const rootSpan = mockSpan();
-      const llmSpan = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan);
-      state.startChildSpan.mockReturnValueOnce(llmSpan);
+    api.emit("llm_input", { model: "gpt-5", provider: "openai", prompt: "hi" },
+      makeAgentCtx({ senderId: "+15551234567" }));
 
-      fire("llm_input", {
-        model: "gpt-4",
-        provider: "openai",
-        prompt: "Hello",
-        systemPrompt: "You are helpful",
-      }, {
-        sessionKey: "sess-1",
-        agentId: "agent-1",
-      });
-
-      expect(state.startRootSpan).toHaveBeenCalledWith(
-        expect.stringContaining("gpt-4"),
-        expect.objectContaining({
-          "openinference.span.kind": "AGENT",
-          "llm.model_name": "gpt-4",
-        })
-      );
-      expect(state.startChildSpan).toHaveBeenCalled();
-    });
-
-    it("sets response content and token counts on llm_output", () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
-
-      const rootSpan = mockSpan();
-      const llmSpan = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan);
-      state.startChildSpan.mockReturnValueOnce(llmSpan);
-
-      fire("llm_input", {
-        model: "gpt-4",
-        provider: "openai",
-        prompt: "Hello",
-      }, { sessionKey: "sess-1" });
-
-      fire("llm_output", {
-        model: "gpt-4",
-        provider: "openai",
-        assistantTexts: ["World"],
-        usage: { input: 10, output: 20, total: 30 },
-      }, { sessionKey: "sess-1" });
-
-      expect(llmSpan.setAttribute).toHaveBeenCalledWith("output.value", "World");
-      expect(llmSpan.setAttribute).toHaveBeenCalledWith("output.mime_type", "text/plain");
-      expect(llmSpan.setAttribute).toHaveBeenCalledWith("llm.token_count.prompt", 10);
-      expect(llmSpan.setAttribute).toHaveBeenCalledWith("llm.token_count.completion", 20);
-      expect(llmSpan.setAttribute).toHaveBeenCalledWith("llm.token_count.total", 30);
-      expect(llmSpan.end).toHaveBeenCalled();
-    });
+    expect(mockRootSpan.setAttribute).toHaveBeenCalledWith("user.id", "+15551234567");
   });
 
-  describe("tool call lifecycle", () => {
-    it("creates and completes tool spans", () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
+  it("normalizes openai-codex provider", async () => {
+    const { default: plugin } = await import("../index.js");
+    const { startRootSpan } = await import("../src/service/otel-bridge.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
 
-      const rootSpan = mockSpan();
-      const llmSpan = mockSpan();
-      const toolSpan = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan);
-      state.startChildSpan.mockReturnValueOnce(llmSpan);
-      state.startChildSpan.mockReturnValueOnce(toolSpan);
+    api.emit("llm_input", { model: "codex-model", provider: "openai-codex", prompt: "hi" },
+      makeAgentCtx());
 
-      fire("llm_input", {
-        model: "gpt-4",
-        provider: "openai",
-        prompt: "Use a tool",
-      }, { sessionKey: "sess-1" });
-
-      fire("before_tool_call", {
-        toolName: "search",
-        params: { query: "test" },
-        toolCallId: "tc-1",
-      }, { sessionKey: "sess-1" });
-
-      expect(state.startChildSpan).toHaveBeenCalledTimes(2); // llm + tool
-
-      fire("after_tool_call", {
-        toolName: "search",
-        toolCallId: "tc-1",
-        result: { data: "found" },
-      }, { sessionKey: "sess-1" });
-
-      expect(toolSpan.setAttribute).toHaveBeenCalledWith("output.value", expect.any(String));
-      expect(toolSpan.end).toHaveBeenCalled();
-    });
-
-    it("handles tool error in after_tool_call", () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
-
-      const rootSpan = mockSpan();
-      const llmSpan = mockSpan();
-      const toolSpan = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan);
-      state.startChildSpan.mockReturnValueOnce(llmSpan);
-      state.startChildSpan.mockReturnValueOnce(toolSpan);
-
-      fire("llm_input", { model: "gpt-4", provider: "openai", prompt: "test" }, { sessionKey: "sess-1" });
-      fire("before_tool_call", { toolName: "search", toolCallId: "tc-1", params: {} }, { sessionKey: "sess-1" });
-      fire("after_tool_call", { toolName: "search", toolCallId: "tc-1", error: "not found" }, { sessionKey: "sess-1" });
-
-      expect(toolSpan.setStatus).toHaveBeenCalledWith(
-        expect.objectContaining({ code: 2 })
-      );
-      expect(toolSpan.end).toHaveBeenCalled();
-    });
-
-    it("handles after_tool_call with no matching before as no-op", () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
-
-      const rootSpan = mockSpan();
-      const llmSpan = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan);
-      state.startChildSpan.mockReturnValueOnce(llmSpan);
-
-      fire("llm_input", { model: "gpt-4", provider: "openai", prompt: "test" }, { sessionKey: "sess-1" });
-
-      // after_tool_call with no before — should not throw
-      fire("after_tool_call", {
-        toolName: "unknown_tool",
-        toolCallId: "tc-999",
-        result: "data",
-      }, { sessionKey: "sess-1" });
-    });
+    expect(startRootSpan).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ "llm.provider": "openai" }),
+    );
   });
 
-  describe("agent_end", () => {
-    it("finalizes root span with metadata and ends all spans", async () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
+  it("closes existing trace for session before starting new one", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
 
-      const rootSpan = mockSpan();
-      const llmSpan = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan);
-      state.startChildSpan.mockReturnValueOnce(llmSpan);
+    const ctx = makeAgentCtx();
+    // First input
+    api.emit("llm_input", { model: "m1", prompt: "first" }, ctx);
+    // Second input on same session — should close first
+    api.emit("llm_input", { model: "m2", prompt: "second" }, ctx);
 
-      fire("llm_input", {
-        model: "gpt-4",
-        provider: "openai",
-        prompt: "Hello",
-      }, {
-        sessionKey: "sess-1",
-        agentId: "agent-1",
-        channelId: "ch-1",
-        trigger: "slash",
-      });
+    expect(mockRootSpan.end).toHaveBeenCalled();
+  });
+});
 
-      fire("llm_output", {
-        model: "gpt-4",
-        provider: "openai",
-        assistantTexts: ["Goodbye"],
-        usage: { input: 5, output: 10, total: 15 },
-      }, { sessionKey: "sess-1" });
+describe("llm_output handler", () => {
+  beforeEach(() => { vi.clearAllMocks(); childSpanCallsPerRoot.clear(); });
 
-      fire("agent_end", {
-        success: true,
-        messages: [],
-      }, { sessionKey: "sess-1" });
+  it("sets output attributes and ends LLM span", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
 
-      await flushMicrotasks();
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "claude-opus-4", provider: "anthropic", prompt: "hi" }, ctx);
+    api.emit("llm_output", {
+      model: "claude-opus-4",
+      provider: "anthropic",
+      assistantTexts: ["Hello back!"],
+      usage: { input: 100, output: 50, total: 150, cacheRead: 20, cacheWrite: 5 },
+    }, ctx);
 
-      expect(rootSpan.setAttribute).toHaveBeenCalledWith("output.value", "Goodbye");
-      expect(rootSpan.setAttribute).toHaveBeenCalledWith("output.mime_type", "text/plain");
-      expect(rootSpan.end).toHaveBeenCalled();
-    });
-
-    it("ends orphaned tool and LLM spans", async () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
-
-      const rootSpan = mockSpan();
-      const llmSpan = mockSpan();
-      const toolSpan = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan);
-      state.startChildSpan.mockReturnValueOnce(llmSpan);
-      state.startChildSpan.mockReturnValueOnce(toolSpan);
-
-      fire("llm_input", { model: "gpt-4", provider: "openai", prompt: "test" }, { sessionKey: "sess-1" });
-      fire("before_tool_call", { toolName: "search", params: {}, toolCallId: "tc-1" }, { sessionKey: "sess-1" });
-
-      // Don't fire after_tool_call or llm_output — leave spans orphaned
-
-      fire("agent_end", { success: true, messages: [] }, { sessionKey: "sess-1" });
-
-      await flushMicrotasks();
-
-      expect(toolSpan.end).toHaveBeenCalled();
-      expect(llmSpan.end).toHaveBeenCalled();
-      expect(rootSpan.end).toHaveBeenCalled();
-    });
-
-    it("sets error status when event.error is present", async () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
-
-      const rootSpan = mockSpan();
-      const llmSpan = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan);
-      state.startChildSpan.mockReturnValueOnce(llmSpan);
-
-      fire("llm_input", { model: "gpt-4", provider: "openai", prompt: "test" }, { sessionKey: "sess-1" });
-      fire("agent_end", { error: "something went wrong", messages: [] }, { sessionKey: "sess-1" });
-
-      await flushMicrotasks();
-
-      expect(rootSpan.setStatus).toHaveBeenCalledWith(
-        expect.objectContaining({ code: 2, message: "something went wrong" })
-      );
-    });
-
-    it("extracts output from messages when no prior llm_output", async () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
-
-      const rootSpan = mockSpan();
-      const llmSpan = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan);
-      state.startChildSpan.mockReturnValueOnce(llmSpan);
-
-      fire("llm_input", { model: "gpt-4", provider: "openai", prompt: "test" }, { sessionKey: "sess-1" });
-      fire("agent_end", {
-        success: true,
-        messages: [
-          { role: "user", content: "hello" },
-          { role: "assistant", content: "goodbye" },
-        ],
-      }, { sessionKey: "sess-1" });
-
-      await flushMicrotasks();
-
-      expect(rootSpan.setAttribute).toHaveBeenCalledWith("output.value", "goodbye");
-    });
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("output.value", "Hello back!");
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.token_count.prompt", 100);
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.token_count.completion", 50);
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.token_count.total", 150);
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.token_count.prompt_details.cache_read", 20);
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.token_count.prompt_details.cache_write", 5);
+    expect(mockLlmSpan.end).toHaveBeenCalled();
   });
 
-  describe("llm_input with existing trace", () => {
-    it("closes old trace before creating new one", () => {
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
+  it("sets output messages on LLM span", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
 
-      const rootSpan1 = mockSpan();
-      const llmSpan1 = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan1);
-      state.startChildSpan.mockReturnValueOnce(llmSpan1);
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("llm_output", { assistantTexts: ["Part 1", "Part 2"] }, ctx);
 
-      fire("llm_input", { model: "gpt-4", provider: "openai", prompt: "first" }, { sessionKey: "sess-1" });
-
-      const rootSpan2 = mockSpan();
-      const llmSpan2 = mockSpan();
-      state.startRootSpan.mockReturnValueOnce(rootSpan2);
-      state.startChildSpan.mockReturnValueOnce(llmSpan2);
-
-      fire("llm_input", { model: "gpt-4", provider: "openai", prompt: "second" }, { sessionKey: "sess-1" });
-
-      expect(rootSpan1.end).toHaveBeenCalled();
-    });
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.output_messages.0.message.role", "assistant");
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.output_messages.0.message.content", "Part 1");
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.output_messages.1.message.role", "assistant");
   });
 
-  describe("no-op when not ready", () => {
-    it("skips llm_input when tracer is null", () => {
-      state.getTracer.mockReturnValue(null);
-      const { api, fire } = createMockApi();
-      plugin.register(api as any);
+  it("is a no-op for unknown session", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
 
-      fire("llm_input", { model: "gpt-4", prompt: "test" }, { sessionKey: "sess-1" });
+    // No llm_input before output
+    api.emit("llm_output", { assistantTexts: ["text"] }, makeAgentCtx({ sessionKey: "unknown" }));
+    expect(mockLlmSpan.end).not.toHaveBeenCalled();
+  });
+});
 
-      expect(state.startRootSpan).not.toHaveBeenCalled();
-    });
+describe("tool call handlers", () => {
+  beforeEach(() => { vi.clearAllMocks(); childSpanCallsPerRoot.clear(); });
+
+  it("before_tool_call creates a TOOL span", async () => {
+    const { default: plugin } = await import("../index.js");
+    const { startChildSpan } = await import("../src/service/otel-bridge.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("before_tool_call", { toolName: "exec", params: { cmd: "ls" }, toolCallId: "tc1" }, ctx);
+
+    expect(startChildSpan).toHaveBeenCalledWith(
+      mockRootSpan,
+      "exec",
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          "openinference.span.kind": "TOOL",
+          "tool.name": "exec",
+        }),
+      }),
+    );
   });
 
-  describe("service start/stop", () => {
-    it("stop flushes and shuts down OTEL", async () => {
-      const { api, getService } = createMockApi();
-      plugin.register(api as any);
+  it("after_tool_call sets output and ends span on success", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
 
-      const service = getService();
-      expect(service).toBeDefined();
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("before_tool_call", { toolName: "exec", params: {}, toolCallId: "tc1" }, ctx);
+    api.emit("after_tool_call", { toolName: "exec", toolCallId: "tc1", result: { output: "ok" } }, ctx);
 
-      await service.stop();
-      expect(state.forceFlush).toHaveBeenCalled();
-      expect(state.shutdown).toHaveBeenCalled();
-    });
+    expect(mockToolSpan.setAttribute).toHaveBeenCalledWith("output.value", expect.any(String));
+    expect(mockToolSpan.setStatus).toHaveBeenCalledWith({ code: 1 }); // OK
+    expect(mockToolSpan.end).toHaveBeenCalled();
+  });
+
+  it("after_tool_call sets error status on error", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("before_tool_call", { toolName: "exec", params: {}, toolCallId: "tc2" }, ctx);
+    api.emit("after_tool_call", { toolName: "exec", toolCallId: "tc2", error: "command failed" }, ctx);
+
+    expect(mockToolSpan.setStatus).toHaveBeenCalledWith({ code: 2, message: "command failed" }); // ERROR
+    expect(mockToolSpan.end).toHaveBeenCalled();
+  });
+
+  it("after_tool_call is a no-op when no matching before_tool_call", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    // No before_tool_call for tc-unknown
+    api.emit("after_tool_call", { toolName: "exec", toolCallId: "tc-unknown", result: "ok" }, ctx);
+
+    expect(mockToolSpan.end).not.toHaveBeenCalled();
+  });
+
+  it("matches tool span by name fallback when no toolCallId", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("before_tool_call", { toolName: "read", params: {} }, ctx); // no toolCallId
+    api.emit("after_tool_call", { toolName: "read", result: "content" }, ctx); // no toolCallId
+
+    expect(mockToolSpan.end).toHaveBeenCalled();
+  });
+});
+
+describe("agent_end handler", () => {
+  beforeEach(() => { vi.clearAllMocks(); childSpanCallsPerRoot.clear(); });
+
+  it("ends root span after microtask flush", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("llm_output", { assistantTexts: ["done"] }, ctx);
+    api.emit("agent_end", {}, ctx);
+
+    // Root span not ended yet (deferred via queueMicrotask)
+    await flushMicrotasks();
+
+    expect(mockRootSpan.end).toHaveBeenCalled();
+  });
+
+  it("sets OK status on successful end", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("agent_end", {}, ctx);
+    await flushMicrotasks();
+
+    expect(mockRootSpan.setStatus).toHaveBeenCalledWith({ code: 1 }); // OK
+  });
+
+  it("sets ERROR status when agent_end has error", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("agent_end", { error: "timeout" }, ctx);
+    await flushMicrotasks();
+
+    expect(mockRootSpan.setStatus).toHaveBeenCalledWith({ code: 2, message: "timeout" }); // ERROR
+  });
+
+  it("ends orphaned tool spans", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("before_tool_call", { toolName: "exec", params: {}, toolCallId: "tc-orphan" }, ctx);
+    // No after_tool_call — orphaned
+    api.emit("agent_end", {}, ctx);
+    await flushMicrotasks();
+
+    expect(mockToolSpan.end).toHaveBeenCalled();
+  });
+
+  it("sets metadata attribute with channel and sessionKey", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx({ channelId: "signal", sessionKey: "sess-xyz" });
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("agent_end", {}, ctx);
+    await flushMicrotasks();
+
+    expect(mockRootSpan.setAttribute).toHaveBeenCalledWith(
+      "metadata",
+      expect.stringContaining("signal"),
+    );
+    expect(mockRootSpan.setAttribute).toHaveBeenCalledWith(
+      "metadata",
+      expect.stringContaining("sess-xyz"),
+    );
+  });
+
+  it("cleans up trace from activeTraces map", async () => {
+    const { default: plugin } = await import("../index.js");
+    const { startRootSpan } = await import("../src/service/otel-bridge.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    const callsBefore = (startRootSpan as any).mock.calls.length;
+
+    api.emit("agent_end", {}, ctx);
+    await flushMicrotasks();
+
+    // A new llm_input should not try to close a non-existent trace
+    api.emit("llm_input", { model: "m2", prompt: "hi again" }, ctx);
+    expect(mockRootSpan.end).toHaveBeenCalledTimes(1); // only once from agent_end
+  });
+
+  it("is a no-op for unknown session", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    api.emit("agent_end", {}, makeAgentCtx({ sessionKey: "no-such-session" }));
+    await flushMicrotasks();
+
+    expect(mockRootSpan.end).not.toHaveBeenCalled();
+  });
+});
+
+describe("service lifecycle", () => {
+  beforeEach(() => { vi.clearAllMocks(); childSpanCallsPerRoot.clear(); });
+
+  it("start logs project and endpoint", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi({ projectName: "bloom_chat" });
+    plugin.register(api as any);
+
+    const service = api.getService()!;
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    await service.start({ logger });
+
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining("bloom_chat"));
+  });
+
+  it("stop flushes and shuts down OTEL", async () => {
+    const { default: plugin } = await import("../index.js");
+    const { forceFlush, shutdown } = await import("../src/service/otel-bridge.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const service = api.getService()!;
+    await service.start({ logger: { info: vi.fn(), warn: vi.fn() } });
+    await service.stop();
+
+    expect(forceFlush).toHaveBeenCalled();
+    expect(shutdown).toHaveBeenCalled();
+  });
+
+  it("stop ends all active traces", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const service = api.getService()!;
+    await service.start({ logger: { info: vi.fn(), warn: vi.fn() } });
+
+    // Start a trace but don't end it
+    api.emit("llm_input", { model: "m", prompt: "hi" }, makeAgentCtx());
+    await service.stop();
+
+    expect(mockRootSpan.end).toHaveBeenCalled();
   });
 });

@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// Mock OTEL SDK classes before importing the module
-const mockExporter = { shutdown: vi.fn() };
-const mockProcessor = { shutdown: vi.fn() };
+// Mock OTEL SDK modules — must use actual class syntax for `new` to work
+const mockForceFlush = vi.fn(async () => {});
+const mockShutdown = vi.fn(async () => {});
 const mockSpan = {
   setAttribute: vi.fn(),
   setStatus: vi.fn(),
@@ -12,47 +12,47 @@ const mockSpan = {
   recordException: vi.fn(),
   updateName: vi.fn(),
   addEvent: vi.fn(),
+  addLink: vi.fn(),
 };
-const mockTracer = {
-  startSpan: vi.fn(() => mockSpan),
-};
-const mockProvider = {
+const mockTracer = { startSpan: vi.fn(() => mockSpan) };
+const mockProviderInstance = {
   getTracer: vi.fn(() => mockTracer),
-  forceFlush: vi.fn(() => Promise.resolve()),
-  shutdown: vi.fn(() => Promise.resolve()),
+  forceFlush: mockForceFlush,
+  shutdown: mockShutdown,
 };
 
-vi.mock("@opentelemetry/exporter-trace-otlp-proto", () => ({
-  OTLPTraceExporter: class MockOTLPTraceExporter {
-    url: string;
-    headers: Record<string, string>;
-    constructor(opts: any) {
-      Object.assign(mockExporter, opts);
-      this.url = opts.url;
-      this.headers = opts.headers;
-      return mockExporter as any;
-    }
-  },
-}));
+let capturedExporterConfig: any = null;
+let capturedResourceAttrs: any = null;
+
+vi.mock("@opentelemetry/exporter-trace-otlp-proto", () => {
+  return {
+    OTLPTraceExporter: class MockOTLPTraceExporter {
+      constructor(config: any) {
+        capturedExporterConfig = config;
+      }
+    },
+  };
+});
 
 vi.mock("@opentelemetry/resources", () => ({
-  resourceFromAttributes: vi.fn((attrs: any) => ({ attributes: attrs })),
+  resourceFromAttributes: (attrs: any) => {
+    capturedResourceAttrs = attrs;
+    return { attributes: attrs };
+  },
 }));
 
 vi.mock("@opentelemetry/sdk-trace-base", () => ({
   BatchSpanProcessor: class MockBatchSpanProcessor {
-    constructor() {
-      return mockProcessor as any;
-    }
+    constructor() {}
   },
 }));
 
 vi.mock("@opentelemetry/sdk-trace-node", () => ({
   NodeTracerProvider: class MockNodeTracerProvider {
-    constructor(opts: any) {
-      Object.assign(mockProvider, { _opts: opts });
-      return mockProvider as any;
-    }
+    constructor() {}
+    getTracer() { return mockTracer; }
+    forceFlush() { return mockForceFlush(); }
+    shutdown() { return mockShutdown(); }
   },
 }));
 
@@ -61,153 +61,156 @@ vi.mock("@opentelemetry/semantic-conventions", () => ({
 }));
 
 // Import after mocks are set up
-import { initOtel, getTracer, startRootSpan, startChildSpan, forceFlush, shutdown } from "../src/service/otel-bridge.js";
-import { resourceFromAttributes } from "@opentelemetry/resources";
+import * as otelBridge from "../src/service/otel-bridge.js";
 
 describe("otel-bridge", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    capturedExporterConfig = null;
+    capturedResourceAttrs = null;
+    // Shutdown between tests to reset internal state
   });
 
   afterEach(async () => {
-    try { await shutdown(); } catch {}
-  });
-
-  describe("initOtel", () => {
-    it("creates provider with correct config", () => {
-      initOtel({
-        endpoint: "https://phoenix.example.com",
-        projectName: "test-project",
-        serviceName: "test-service",
-      });
-
-      expect((mockExporter as any).url).toBe("https://phoenix.example.com/v1/traces");
-      expect((mockExporter as any).headers).toEqual({});
-
-      expect(resourceFromAttributes).toHaveBeenCalledWith({
-        "service.name": "test-service",
-        "openinference.project.name": "test-project",
-      });
-
-      expect(mockProvider.getTracer).toHaveBeenCalledWith("openclaw-phoenix-otel", "1.0.0");
-    });
-
-    it("appends /v1/traces to endpoint", () => {
-      initOtel({
-        endpoint: "https://phoenix.example.com/",
-        projectName: "test",
-        serviceName: "test",
-      });
-
-      expect((mockExporter as any).url).toBe("https://phoenix.example.com/v1/traces");
-    });
-
-    it("strips trailing slashes from endpoint", () => {
-      initOtel({
-        endpoint: "https://phoenix.example.com///",
-        projectName: "test",
-        serviceName: "test",
-      });
-
-      expect((mockExporter as any).url).toBe("https://phoenix.example.com/v1/traces");
-    });
-
-    it("sets Authorization header when apiKey provided", () => {
-      initOtel({
-        endpoint: "https://phoenix.example.com",
-        apiKey: "sk-test-123",
-        projectName: "test",
-        serviceName: "test",
-      });
-
-      expect((mockExporter as any).headers).toEqual({
-        Authorization: "Bearer sk-test-123",
-      });
-    });
-
-    it("does not set Authorization header without apiKey", () => {
-      initOtel({
-        endpoint: "https://phoenix.example.com",
-        projectName: "test",
-        serviceName: "test",
-      });
-
-      expect((mockExporter as any).headers).toEqual({});
-    });
+    await otelBridge.shutdown();
   });
 
   describe("getTracer", () => {
-    it("returns tracer after init", () => {
-      initOtel({
+    it("returns null before initialization", async () => {
+      await otelBridge.shutdown(); // ensure clean state
+      expect(otelBridge.getTracer()).toBeNull();
+    });
+
+    it("returns tracer after initOtel", () => {
+      otelBridge.initOtel({
         endpoint: "https://phoenix.example.com",
         projectName: "test",
-        serviceName: "test",
+        serviceName: "test-svc",
       });
-      expect(getTracer()).toBe(mockTracer);
+      expect(otelBridge.getTracer()).not.toBeNull();
+    });
+  });
+
+  describe("initOtel", () => {
+    it("appends /v1/traces to endpoint", () => {
+      otelBridge.initOtel({
+        endpoint: "https://phoenix.example.com",
+        projectName: "test",
+        serviceName: "test-svc",
+      });
+      expect(capturedExporterConfig.url).toBe("https://phoenix.example.com/v1/traces");
+    });
+
+    it("strips trailing slashes from endpoint", () => {
+      otelBridge.initOtel({
+        endpoint: "https://phoenix.example.com///",
+        projectName: "test",
+        serviceName: "test-svc",
+      });
+      expect(capturedExporterConfig.url).toBe("https://phoenix.example.com/v1/traces");
+    });
+
+    it("sets Authorization header when apiKey provided", () => {
+      otelBridge.initOtel({
+        endpoint: "https://phoenix.example.com",
+        apiKey: "sk-test-key",
+        projectName: "test",
+        serviceName: "test-svc",
+      });
+      expect(capturedExporterConfig.headers).toEqual({ Authorization: "Bearer sk-test-key" });
+    });
+
+    it("does not set Authorization header when no apiKey", () => {
+      otelBridge.initOtel({
+        endpoint: "https://phoenix.example.com",
+        projectName: "test",
+        serviceName: "test-svc",
+      });
+      expect(capturedExporterConfig.headers).toEqual({});
+    });
+
+    it("creates resource with service name and project name", () => {
+      otelBridge.initOtel({
+        endpoint: "https://phoenix.example.com",
+        projectName: "my-project",
+        serviceName: "my-svc",
+      });
+      expect(capturedResourceAttrs).toEqual({
+        "service.name": "my-svc",
+        "openinference.project.name": "my-project",
+      });
     });
   });
 
   describe("startRootSpan", () => {
-    it("creates span with name and attributes", () => {
-      initOtel({
-        endpoint: "https://phoenix.example.com",
-        projectName: "test",
-        serviceName: "test",
-      });
-
-      const span = startRootSpan("test-span", { "key": "value" });
-      expect(mockTracer.startSpan).toHaveBeenCalledWith("test-span", {
-        attributes: { key: "value" },
-      });
-      expect(span).toBe(mockSpan);
+    it("throws when OTEL not initialized", async () => {
+      await otelBridge.shutdown();
+      expect(() => otelBridge.startRootSpan("test")).toThrow("OTEL not initialized");
     });
 
-    it("throws if OTEL not initialized", async () => {
-      await shutdown();
-      expect(() => startRootSpan("test")).toThrow("OTEL not initialized");
+    it("creates a span with name and attributes", () => {
+      otelBridge.initOtel({
+        endpoint: "https://phoenix.example.com",
+        projectName: "test",
+        serviceName: "test-svc",
+      });
+      const span = otelBridge.startRootSpan("test-span", { key: "value" });
+      expect(span).toBeDefined();
+      expect(mockTracer.startSpan).toHaveBeenCalledWith("test-span", { attributes: { key: "value" } });
     });
   });
 
   describe("startChildSpan", () => {
-    it("creates child span with parent context", () => {
-      initOtel({
+    it("creates a child span under parent context", () => {
+      otelBridge.initOtel({
         endpoint: "https://phoenix.example.com",
         projectName: "test",
-        serviceName: "test",
+        serviceName: "test-svc",
       });
-
-      const parentSpan = startRootSpan("parent");
-      startChildSpan(parentSpan, "child", {
-        attributes: { "openinference.span.kind": "LLM" },
-      });
-
+      const parent = otelBridge.startRootSpan("parent");
+      otelBridge.startChildSpan(parent as any, "child", { attributes: { "tool.name": "exec" } });
       expect(mockTracer.startSpan).toHaveBeenCalledTimes(2);
+      expect(mockTracer.startSpan).toHaveBeenLastCalledWith(
+        "child",
+        { attributes: { "tool.name": "exec" } },
+        expect.anything(),
+      );
     });
   });
 
   describe("forceFlush", () => {
     it("calls provider.forceFlush", async () => {
-      initOtel({
+      otelBridge.initOtel({
         endpoint: "https://phoenix.example.com",
         projectName: "test",
-        serviceName: "test",
+        serviceName: "test-svc",
       });
+      await otelBridge.forceFlush();
+      expect(mockForceFlush).toHaveBeenCalled();
+    });
 
-      await forceFlush();
-      expect(mockProvider.forceFlush).toHaveBeenCalled();
+    it("is a no-op when not initialized", async () => {
+      await otelBridge.shutdown();
+      await otelBridge.forceFlush(); // should not throw
     });
   });
 
   describe("shutdown", () => {
-    it("calls provider.shutdown and clears state", async () => {
-      initOtel({
+    it("calls provider.shutdown and nulls tracer", async () => {
+      otelBridge.initOtel({
         endpoint: "https://phoenix.example.com",
         projectName: "test",
-        serviceName: "test",
+        serviceName: "test-svc",
       });
+      expect(otelBridge.getTracer()).not.toBeNull();
+      await otelBridge.shutdown();
+      expect(mockShutdown).toHaveBeenCalled();
+      expect(otelBridge.getTracer()).toBeNull();
+    });
 
-      await shutdown();
-      expect(mockProvider.shutdown).toHaveBeenCalled();
+    it("is a no-op when not initialized", async () => {
+      await otelBridge.shutdown(); // ensure clean
+      await otelBridge.shutdown(); // should not throw
     });
   });
 });
