@@ -1,0 +1,17 @@
+{
+  "id": "phoenix-otel",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "endpoint": { "type": "string" },
+      "apiKey": { "type": "string" },
+      "projectName": { "type": "string" },
+      "serviceName": { "type": "string" },
+      "staleTraceTimeoutMs": { "type": "number" },
+      "staleSweepIntervalMs": { "type": "number" },
+      "staleTraceCleanupEnabled": { "type": "boolean" }
+    }
+  }
+}

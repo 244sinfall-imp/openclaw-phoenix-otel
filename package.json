@@ -1,0 +1,23 @@
+{
+  "name": "openclaw-phoenix-otel",
+  "version": "1.0.0",
+  "description": "OpenClaw plugin that exports full agent traces to Phoenix (Arize) via OpenTelemetry",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/exiao/openclaw-phoenix-otel"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.213.0",
+    "@opentelemetry/resources": "^2.6.0",
+    "@opentelemetry/sdk-trace-base": "^2.6.0",
+    "@opentelemetry/sdk-trace-node": "^2.6.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
