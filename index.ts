@@ -19,6 +19,7 @@ const plugin = {
     const activeTraces = new Map<string, ActiveTrace>();
     let lastActiveSessionKey: string | undefined;
     const sessionByAgentId = new Map<string, string>();
+    let staleSweepTimer: ReturnType<typeof setInterval> | null = null;
 
     // Init OTEL immediately in register() so hooks can create spans right away
     const endpoint = pluginConfig.endpoint ?? process.env.PHOENIX_HOST ?? DEFAULT_ENDPOINT;
@@ -69,7 +70,17 @@ const plugin = {
           "llm.model_name": event.model ?? "",
           "llm.provider": normalizedProvider ?? "",
           "session.id": sessionKey,
+          // [6] agent.name on root AGENT span
+          "agent.name": serviceName,
         });
+
+        // [3] Add user.id from agentCtx sender info
+        const userId = asNonEmptyString(agentCtx.senderId)
+          ?? asNonEmptyString(agentCtx.userId)
+          ?? asNonEmptyString(agentCtx.senderName);
+        if (userId) {
+          rootSpan.setAttribute("user.id", userId);
+        }
 
         // Create child LLM span
         const sanitizedLlmInput = sanitizeValue({
@@ -88,6 +99,12 @@ const plugin = {
             "llm.provider": normalizedProvider ?? "",
           },
         });
+
+        // [10] Add llm.invocation_parameters if available
+        const invocationParams = event.invocationParams ?? event.params;
+        if (invocationParams && typeof invocationParams === "object" && Object.keys(invocationParams).length > 0) {
+          llmSpan.setAttribute("llm.invocation_parameters", safeStringify(invocationParams));
+        }
 
         // Set input messages on LLM span
         let idx = 0;
@@ -115,7 +132,7 @@ const plugin = {
           rootSpan,
           llmSpan,
           toolSpans: new Map(),
-          subagentSpans: new Map(),
+          subagentSpans: new Map(), // Reserved for future subagent hook support
           startedAt: now,
           lastActivityAt: now,
           costMeta: {},
@@ -124,6 +141,8 @@ const plugin = {
           provider: normalizedProvider,
           channelId,
           trigger: resolveTrigger(agentCtx as Record<string, unknown>),
+          agentId: asNonEmptyString(agentCtx.agentId),
+          userId,
         });
       } catch (err) {
         console.warn(`[phoenix-otel] llm_input span creation failed: ${formatError(err)}`);
@@ -168,6 +187,8 @@ const plugin = {
         if (event.usage.total != null) active.llmSpan.setAttribute("llm.token_count.total", event.usage.total);
         if (event.usage.cacheRead != null) active.llmSpan.setAttribute("llm.token_count.prompt_details.cache_read", event.usage.cacheRead);
         if (event.usage.cacheWrite != null) active.llmSpan.setAttribute("llm.token_count.prompt_details.cache_write", event.usage.cacheWrite);
+        // [9] Add reasoning token count
+        if (event.usage.reasoning != null) active.llmSpan.setAttribute("llm.token_count.completion_details.reasoning", event.usage.reasoning);
       }
 
       active.llmSpan.setStatus({ code: SpanStatusCode.OK });
@@ -181,6 +202,7 @@ const plugin = {
     });
 
     // ---- TOOL CALLS ----
+    // [1] openinference.span.kind: "TOOL" is set as top-level attribute
     api.on("before_tool_call", (event: any, toolCtx: any) => {
       if (!isReady()) return;
       const sessionKey = toolCtx.sessionKey;
@@ -241,6 +263,7 @@ const plugin = {
 
       if (event.error) {
         matchedSpan.setAttribute("output.value", safeStringify({ error: sanitizeString(event.error) }));
+        matchedSpan.setAttribute("output.mime_type", "application/json");
         matchedSpan.setStatus({ code: SpanStatusCode.ERROR, message: sanitizeString(event.error) });
       } else if (event.result !== undefined) {
         matchedSpan.setAttribute("output.value", safeStringify(sanitizeValue(event.result)));
@@ -274,12 +297,25 @@ const plugin = {
         const current = activeTraces.get(sessionKey);
         if (!current || current.rootSpan !== rootRef) return;
 
+        // [5] Fix output.value: extract plain text instead of raw JSON
         let outputText = "";
         if (current.output) {
           outputText = current.output.output;
         } else if (event.messages?.length) {
           const last = [...event.messages].reverse().find((m: any) => m?.role === "assistant");
-          if (last) outputText = safeStringify(last);
+          if (last) {
+            // Extract text content from message object
+            if (typeof last.content === "string") {
+              outputText = last.content;
+            } else if (Array.isArray(last.content)) {
+              outputText = last.content
+                .filter((c: any) => c && (c.type === "text" || typeof c === "string"))
+                .map((c: any) => typeof c === "string" ? c : c.text ?? "")
+                .join("\n\n");
+            } else {
+              outputText = safeStringify(last);
+            }
+          }
         }
 
         if (outputText) {
@@ -291,7 +327,16 @@ const plugin = {
         const provider = current.provider ?? current.costMeta.provider;
         if (model) current.rootSpan.setAttribute("llm.model_name", model);
         if (provider) current.rootSpan.setAttribute("llm.provider", provider);
-        if (current.channelId) current.rootSpan.setAttribute("metadata.channel", current.channelId);
+
+        // [4] Add metadata JSON attribute (includes channel, so no standalone metadata.channel needed)
+        const metadata: Record<string, string> = {};
+        if (current.channelId) metadata.channel = current.channelId;
+        if (current.trigger) metadata.trigger = current.trigger;
+        if (current.agentId) metadata.agentId = current.agentId;
+        if (sessionKey) metadata.sessionKey = sessionKey;
+        if (Object.keys(metadata).length > 0) {
+          current.rootSpan.setAttribute("metadata", JSON.stringify(metadata));
+        }
 
         const usage = hasUsageFields(current.usage) ? current.usage : (hasCostUsageFields(current.costMeta) ? {
           input: current.costMeta.usageInput, output: current.costMeta.usageOutput, total: current.costMeta.usageTotal,
@@ -333,9 +378,38 @@ const plugin = {
           }
         });
 
+        // [8] Stale trace cleanup
+        const staleTimeout = pluginConfig.staleTraceTimeoutMs ?? DEFAULT_STALE_TRACE_TIMEOUT_MS;
+        const sweepInterval = pluginConfig.staleSweepIntervalMs ?? DEFAULT_STALE_SWEEP_INTERVAL_MS;
+        const cleanupEnabled = pluginConfig.staleTraceCleanupEnabled !== false; // enabled by default
+
+        if (cleanupEnabled) {
+          staleSweepTimer = setInterval(() => {
+            const now = Date.now();
+            for (const [key, trace] of activeTraces) {
+              if (now - trace.lastActivityAt > staleTimeout) {
+                ctx.logger.warn(`phoenix: cleaning up stale trace for session ${key} (inactive for ${Math.round((now - trace.lastActivityAt) / 1000)}s)`);
+                // End orphaned spans
+                for (const [, s] of trace.toolSpans) { try { s.end(); } catch {} }
+                for (const [, s] of trace.subagentSpans) { try { s.end(); } catch {} }
+                if (trace.llmSpan) { try { trace.llmSpan.end(); } catch {} }
+                trace.rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: "Stale trace cleaned up" });
+                try { trace.rootSpan.end(); } catch {}
+                activeTraces.delete(key);
+              }
+            }
+          }, sweepInterval);
+        }
+
         ctx.logger.info(`phoenix: exporting traces to "${projectName}" at ${endpoint}`);
       },
       async stop() {
+        // [8] Clear stale sweep interval
+        if (staleSweepTimer) {
+          clearInterval(staleSweepTimer);
+          staleSweepTimer = null;
+        }
+
         for (const [, active] of activeTraces) {
           try { active.rootSpan.end(); } catch {}
         }
