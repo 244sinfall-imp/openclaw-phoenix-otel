@@ -132,7 +132,7 @@ const plugin = {
           rootSpan,
           llmSpan,
           toolSpans: new Map(),
-          subagentSpans: new Map(),
+          subagentSpans: new Map(), // Reserved for future subagent hook support
           startedAt: now,
           lastActivityAt: now,
           costMeta: {},
@@ -263,6 +263,7 @@ const plugin = {
 
       if (event.error) {
         matchedSpan.setAttribute("output.value", safeStringify({ error: sanitizeString(event.error) }));
+        matchedSpan.setAttribute("output.mime_type", "application/json");
         matchedSpan.setStatus({ code: SpanStatusCode.ERROR, message: sanitizeString(event.error) });
       } else if (event.result !== undefined) {
         matchedSpan.setAttribute("output.value", safeStringify(sanitizeValue(event.result)));
@@ -326,14 +327,8 @@ const plugin = {
         const provider = current.provider ?? current.costMeta.provider;
         if (model) current.rootSpan.setAttribute("llm.model_name", model);
         if (provider) current.rootSpan.setAttribute("llm.provider", provider);
-        if (current.channelId) current.rootSpan.setAttribute("metadata.channel", current.channelId);
 
-        // [2] Add cost tracking
-        if (current.costMeta.costUsd != null) {
-          current.rootSpan.setAttribute("llm.cost.total", current.costMeta.costUsd);
-        }
-
-        // [4] Add metadata JSON attribute
+        // [4] Add metadata JSON attribute (includes channel, so no standalone metadata.channel needed)
         const metadata: Record<string, string> = {};
         if (current.channelId) metadata.channel = current.channelId;
         if (current.trigger) metadata.trigger = current.trigger;
@@ -342,9 +337,6 @@ const plugin = {
         if (Object.keys(metadata).length > 0) {
           current.rootSpan.setAttribute("metadata", JSON.stringify(metadata));
         }
-
-        // [6] agent.name on root span (already set at creation, but ensure it's there)
-        // agent.name is set during span creation in llm_input
 
         const usage = hasUsageFields(current.usage) ? current.usage : (hasCostUsageFields(current.costMeta) ? {
           input: current.costMeta.usageInput, output: current.costMeta.usageOutput, total: current.costMeta.usageTotal,
