@@ -185,9 +185,6 @@ const plugin = {
         if (event.usage.cacheWrite != null) active.llmSpan.setAttribute("llm.token_count.prompt_details.cache_write", event.usage.cacheWrite);
         // [9] Add reasoning token count
         if (event.usage.reasoning != null) active.llmSpan.setAttribute("llm.token_count.completion_details.reasoning", event.usage.reasoning);
-        console.info(`[phoenix-otel] llm_output usage: input=${event.usage.input} output=${event.usage.output} total=${event.usage.total} cacheRead=${event.usage.cacheRead} cacheWrite=${event.usage.cacheWrite}`);
-      } else {
-        console.info(`[phoenix-otel] llm_output: NO usage data in event. event keys: ${Object.keys(event).join(", ")}`);
       }
 
       active.llmSpan.setStatus({ code: SpanStatusCode.OK });
@@ -366,7 +363,6 @@ const plugin = {
         onDiagnosticEvent((evt: any) => {
           if (evt.type !== "model.usage") return;
           const active = activeTraces.get(evt.sessionKey);
-          console.info(`[phoenix-otel] diagnostic model.usage: session=${evt.sessionKey} hasActive=${!!active} usage=${JSON.stringify(evt.usage)} cost=${evt.costUsd}`);
           if (!active) return;
           if (evt.costUsd !== undefined) active.costMeta.costUsd = evt.costUsd;
           if (evt.model) active.costMeta.model = evt.model;
