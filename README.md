@@ -16,15 +16,21 @@ Export full agent traces from [OpenClaw](https://github.com/openclaw/openclaw) t
 - **Proper span hierarchy**: AGENT → LLM → TOOL
 - **OpenInference semantic conventions** for native Phoenix rendering
 
-## Install
+## Quick Start
+
+> **Already have OpenClaw?** Ask your assistant:
+> *"Please read https://raw.githubusercontent.com/exiao/openclaw-phoenix-otel/main/SETUP.md and follow the instructions to install the Phoenix OTEL plugin."*
+
+### Manual install
 
 ```bash
-openclaw plugins install ./openclaw-phoenix-otel
+git clone https://github.com/exiao/openclaw-phoenix-otel.git
+cd openclaw-phoenix-otel
+npm install
+openclaw plugins install .
 ```
 
-## Configure
-
-Add to your `~/.openclaw/openclaw.json`:
+Then add your Phoenix credentials to `~/.openclaw/openclaw.json`:
 
 ```json
 {
@@ -45,11 +51,13 @@ Add to your `~/.openclaw/openclaw.json`:
 }
 ```
 
-Then restart the gateway:
+Restart the gateway:
 
 ```bash
 openclaw gateway restart
 ```
+
+For detailed setup instructions, troubleshooting, and verification steps, see **[SETUP.md](SETUP.md)**.
 
 ## Config options
 

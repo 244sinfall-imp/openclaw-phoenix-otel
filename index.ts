@@ -57,16 +57,12 @@ const plugin = {
       }
 
       try {
-        const sanitizedInput = sanitizeValue({
-          prompt: event.prompt,
-          systemPrompt: event.systemPrompt,
-          imagesCount: event.imagesCount,
-        }) as Record<string, unknown>;
+        const userPrompt = typeof event.prompt === "string" ? sanitizeString(event.prompt) : "";
 
         const rootSpan = startRootSpan(`${event.model} · ${channelId ?? "unknown"}`, {
           "openinference.span.kind": "AGENT",
-          "input.value": safeStringify(sanitizedInput),
-          "input.mime_type": "application/json",
+          "input.value": userPrompt,
+          "input.mime_type": "text/plain",
           "llm.model_name": event.model ?? "",
           "llm.provider": normalizedProvider ?? "",
           "session.id": sessionKey,
