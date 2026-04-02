@@ -61,10 +61,10 @@ jobs:
             For everything else, describe the problem and recommended solution in your review comment.
 
             REVIEW SUBMISSION:
-            After completing your review, you MUST submit a formal GitHub review:
+            After completing your review, submit a formal GitHub review using gh pr review:
             - If you found issues: `gh pr review ${{ github.event.pull_request.number }} --request-changes --body "Summary of issues found"`
             - If LGTM: `gh pr review ${{ github.event.pull_request.number }} --approve --body "LGTM - brief summary"`
-            Every review must end with one of these two commands.
+            If gh pr review fails (e.g. permissions), fall back to posting a comment with `gh pr comment` instead.
 
           claude_args: |
             --model claude-sonnet-4-6
