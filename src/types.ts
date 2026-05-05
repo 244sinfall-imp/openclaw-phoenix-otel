@@ -45,6 +45,7 @@ export type ActiveTrace = {
   rootSpan: Span;
   llmSpan: Span | null;
   toolSpans: Map<string, Span>;
+  completedToolCallIds: Set<string>;
   subagentSpans: Map<string, Span>;
   startedAt: number;
   lastActivityAt: number;

@@ -181,6 +181,41 @@ describe("llm_input handler", () => {
     );
   });
 
+  it("exports tool-call messages using OpenInference tool_call attributes", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    api.emit("llm_input", {
+      model: "m",
+      prompt: "continue",
+      historyMessages: [
+        {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call-1", name: "exec", arguments: { command: "pwd" } }],
+        },
+        {
+          role: "toolResult",
+          content: [{ type: "toolResult", toolUseId: "call-1", content: "/repo" }],
+        },
+      ],
+    }, makeAgentCtx());
+
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.0.message.role", "assistant");
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith(
+      "llm.input_messages.0.message.tool_calls.0.tool_call.id", "call-1",
+    );
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith(
+      "llm.input_messages.0.message.tool_calls.0.tool_call.function.name", "exec",
+    );
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith(
+      "llm.input_messages.0.message.tool_calls.0.tool_call.function.arguments", '{"command":"pwd"}',
+    );
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.1.message.role", "tool");
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.1.message.tool_call_id", "call-1");
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.1.message.content", "/repo");
+  });
+
   it("closes existing trace for session before starting new one", async () => {
     const { default: plugin } = await import("../index.js");
     const api = buildMockApi();
@@ -424,6 +459,44 @@ describe("agent_end handler", () => {
     // A new llm_input should not try to close a non-existent trace
     api.emit("llm_input", { model: "m2", prompt: "hi again" }, ctx);
     expect(mockRootSpan.end).toHaveBeenCalledTimes(1); // only once from agent_end
+  });
+
+  it("creates post-hoc TOOL spans from message snapshots when hook spans were missing", async () => {
+    const { default: plugin } = await import("../index.js");
+    const { startChildSpan } = await import("../src/service/otel-bridge.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+    api.emit("agent_end", {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "README.md" } }],
+        },
+        {
+          role: "toolResult",
+          content: [{ type: "toolResult", toolUseId: "call-1", content: "# README" }],
+        },
+      ],
+    }, ctx);
+    await flushMicrotasks();
+
+    expect(startChildSpan).toHaveBeenCalledWith(
+      mockRootSpan,
+      "read",
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          "openinference.span.kind": "TOOL",
+          "tool.name": "read",
+          "tool.id": "call-1",
+          "tool_call.function.arguments": '{"path":"README.md"}',
+        }),
+      }),
+    );
+    expect(mockToolSpan.setAttribute).toHaveBeenCalledWith("output.value", "# README");
+    expect(mockToolSpan.end).toHaveBeenCalled();
   });
 
   it("is a no-op for unknown session", async () => {

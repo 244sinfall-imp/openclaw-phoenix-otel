@@ -6,6 +6,7 @@ import type { Span } from "@opentelemetry/api";
 import { initOtel, startRootSpan, startChildSpan, forceFlush, shutdown as shutdownOtel, getTracer } from "./src/service/otel-bridge.js";
 import { sanitizeValue, sanitizeString } from "./src/service/payload-sanitizer.js";
 import { normalizeProvider, resolveChannelId, resolveTrigger, safeStringify, formatError, asNonEmptyString, hasUsageFields, hasCostUsageFields } from "./src/service/helpers.js";
+import { extractToolCallsFromMessages, setOpenInferenceMessageAttributes } from "./src/service/openinference-messages.js";
 import { parsePhoenixPluginConfig, type ActiveTrace } from "./src/types.js";
 import { DEFAULT_PROJECT_NAME, DEFAULT_SERVICE_NAME, DEFAULT_ENDPOINT, DEFAULT_STALE_TRACE_TIMEOUT_MS, DEFAULT_STALE_SWEEP_INTERVAL_MS, PHOENIX_PLUGIN_ID } from "./src/service/constants.js";
 
@@ -105,22 +106,23 @@ const plugin = {
         // Set input messages on LLM span
         let idx = 0;
         if (event.systemPrompt && typeof event.systemPrompt === "string") {
-          llmSpan.setAttribute(`llm.input_messages.${idx}.message.role`, "system");
-          llmSpan.setAttribute(`llm.input_messages.${idx}.message.content`, safeStringify(event.systemPrompt));
+          setOpenInferenceMessageAttributes(llmSpan, "llm.input_messages", idx, {
+            role: "system",
+            content: event.systemPrompt,
+          });
           idx++;
         }
         if (Array.isArray(event.historyMessages)) {
           for (const msg of event.historyMessages) {
-            if (msg && typeof msg === "object" && "role" in msg) {
-              llmSpan.setAttribute(`llm.input_messages.${idx}.message.role`, String(msg.role ?? "user"));
-              llmSpan.setAttribute(`llm.input_messages.${idx}.message.content`, safeStringify(msg.content ?? msg.text ?? ""));
-              idx++;
-            }
+            setOpenInferenceMessageAttributes(llmSpan, "llm.input_messages", idx, msg);
+            idx++;
           }
         }
         if (event.prompt) {
-          llmSpan.setAttribute(`llm.input_messages.${idx}.message.role`, "user");
-          llmSpan.setAttribute(`llm.input_messages.${idx}.message.content`, safeStringify(event.prompt));
+          setOpenInferenceMessageAttributes(llmSpan, "llm.input_messages", idx, {
+            role: "user",
+            content: event.prompt,
+          });
         }
 
         const now = Date.now();
@@ -139,6 +141,7 @@ const plugin = {
           trigger: resolveTrigger(agentCtx as Record<string, unknown>),
           agentId: asNonEmptyString(agentCtx.agentId),
           userId,
+          completedToolCallIds: new Set(),
         });
       } catch (err) {
         console.warn(`[phoenix-otel] llm_input span creation failed: ${formatError(err)}`);
@@ -172,9 +175,15 @@ const plugin = {
       active.llmSpan.setAttribute("llm.model_name", event.model ?? active.model ?? "");
       active.llmSpan.setAttribute("llm.provider", normalizedProvider ?? active.provider ?? "");
 
-      for (let i = 0; i < texts.length; i++) {
-        active.llmSpan.setAttribute(`llm.output_messages.${i}.message.role`, "assistant");
-        active.llmSpan.setAttribute(`llm.output_messages.${i}.message.content`, texts[i]);
+      if (sanitizedOutput.lastAssistant && typeof sanitizedOutput.lastAssistant === "object") {
+        setOpenInferenceMessageAttributes(active.llmSpan, "llm.output_messages", 0, sanitizedOutput.lastAssistant);
+      } else {
+        for (let i = 0; i < texts.length; i++) {
+          setOpenInferenceMessageAttributes(active.llmSpan, "llm.output_messages", i, {
+            role: "assistant",
+            content: texts[i],
+          });
+        }
       }
 
       if (event.usage) {
@@ -269,6 +278,7 @@ const plugin = {
 
       matchedSpan.end();
       active.toolSpans.delete(matchedKey);
+      if (toolCallId) active.completedToolCallIds.add(String(toolCallId));
     });
 
     // ---- AGENT END ----
@@ -343,6 +353,47 @@ const plugin = {
           if (usage.total != null) current.rootSpan.setAttribute("llm.token_count.total", usage.total);
         }
 
+        // Some harnesses/providers preserve tool calls only in final message
+        // snapshots instead of emitting before_tool_call/after_tool_call hooks.
+        // Convert those message-level tool calls into first-class TOOL spans so
+        // Phoenix renders them in the trace tree instead of burying them in one
+        // scrollable chat transcript.
+        for (const call of extractToolCallsFromMessages(event.messages)) {
+          if (call.id && current.completedToolCallIds.has(call.id)) continue;
+          try {
+            const attrs: Record<string, string | number | boolean> = {
+              "openinference.span.kind": "TOOL",
+              "tool.name": call.name,
+              "input.value": safeStringify(sanitizeValue(call.arguments ?? {})),
+              "input.mime_type": "application/json",
+              "tool_call.function.name": call.name,
+            };
+            if (call.id) {
+              attrs["tool.id"] = call.id;
+              attrs["tool_call.id"] = call.id;
+            }
+            if (call.arguments !== undefined) {
+              attrs["tool_call.function.arguments"] = safeStringify(sanitizeValue(call.arguments));
+            }
+            const span = startChildSpan(current.rootSpan, call.name, { attributes: attrs });
+            if (call.error) {
+              span.setAttribute("output.value", safeStringify({ error: sanitizeString(call.error) }));
+              span.setAttribute("output.mime_type", "application/json");
+              span.setStatus({ code: SpanStatusCode.ERROR, message: sanitizeString(call.error) });
+            } else if (call.result !== undefined) {
+              span.setAttribute("output.value", safeStringify(sanitizeValue(call.result)));
+              span.setAttribute("output.mime_type", "application/json");
+              span.setStatus({ code: SpanStatusCode.OK });
+            } else {
+              span.setStatus({ code: SpanStatusCode.OK });
+            }
+            span.end();
+            if (call.id) current.completedToolCallIds.add(call.id);
+          } catch (err) {
+            console.warn(`[phoenix-otel] post-hoc tool span creation failed: ${formatError(err)}`);
+          }
+        }
+
         if (event.error) {
           current.rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: String(event.error) });
         } else {
@@ -357,7 +408,7 @@ const plugin = {
     // ---- SERVICE (just handles OTEL init/shutdown) ----
     api.registerService({
       id: PHOENIX_PLUGIN_ID,
-      async start(ctx) {
+      async start(ctx: any) {
         ctx.logger.info(`phoenix: tracing to "${projectName}" at ${endpoint}`);
         // Subscribe to diagnostic events for cost metadata
         onDiagnosticEvent((evt: any) => {
