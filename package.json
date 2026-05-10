@@ -16,6 +16,8 @@
     "@opentelemetry/sdk-trace-node": "^2.6.0"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
     "test": "vitest run"
   },
   "openclaw": {
