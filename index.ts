@@ -10,6 +10,55 @@ import { extractToolCallsFromMessages, setOpenInferenceMessageAttributes } from 
 import { parsePhoenixPluginConfig, type ActiveTrace } from "./src/types.js";
 import { DEFAULT_PROJECT_NAME, DEFAULT_SERVICE_NAME, DEFAULT_ENDPOINT, DEFAULT_STALE_TRACE_TIMEOUT_MS, DEFAULT_STALE_SWEEP_INTERVAL_MS, PHOENIX_PLUGIN_ID } from "./src/service/constants.js";
 
+function extractMessageTextForScope(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const m = message as Record<string, unknown>;
+
+  if (typeof m.content === "string") return m.content;
+  if (typeof m.text === "string") return m.text;
+
+  if (Array.isArray(m.content)) {
+    const parts: string[] = [];
+    for (const part of m.content) {
+      if (typeof part === "string") {
+        parts.push(part);
+        continue;
+      }
+      if (!part || typeof part !== "object") continue;
+      const p = part as Record<string, unknown>;
+      if (typeof p.text === "string") parts.push(p.text);
+      else if (typeof p.content === "string") parts.push(p.content);
+      else if (typeof p.output === "string") parts.push(p.output);
+    }
+    return parts.join("\n\n").trim();
+  }
+
+  return "";
+}
+
+function scopeMessagesToCurrentTurn(messages: unknown, prompt?: string): unknown[] {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+
+  const promptText = typeof prompt === "string" ? prompt.trim() : "";
+  if (!promptText) return messages;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message || typeof message !== "object") continue;
+    const role = (message as Record<string, unknown>).role;
+    if (role !== "user") continue;
+
+    const text = extractMessageTextForScope(message).trim();
+    if (!text) continue;
+
+    if (text === promptText || text.includes(promptText) || promptText.includes(text)) {
+      return messages.slice(i);
+    }
+  }
+
+  return messages;
+}
+
 const plugin = {
   id: "phoenix-otel",
   name: "Phoenix OTEL",
@@ -103,7 +152,11 @@ const plugin = {
           llmSpan.setAttribute("llm.invocation_parameters", safeStringify(invocationParams));
         }
 
-        // Set input messages on LLM span
+        // Set input messages on LLM span.  Deliberately avoid exporting raw
+        // historyMessages here: OpenClaw history snapshots can include prior
+        // turns' assistant tool calls/results, which makes Phoenix render stale
+        // tools vertically inside the current LLM span.  Current-turn tool calls
+        // are exported as first-class TOOL spans from agent_end instead.
         let idx = 0;
         if (event.systemPrompt && typeof event.systemPrompt === "string") {
           setOpenInferenceMessageAttributes(llmSpan, "llm.input_messages", idx, {
@@ -111,12 +164,6 @@ const plugin = {
             content: event.systemPrompt,
           });
           idx++;
-        }
-        if (Array.isArray(event.historyMessages)) {
-          for (const msg of event.historyMessages) {
-            setOpenInferenceMessageAttributes(llmSpan, "llm.input_messages", idx, msg);
-            idx++;
-          }
         }
         if (event.prompt) {
           setOpenInferenceMessageAttributes(llmSpan, "llm.input_messages", idx, {
@@ -130,6 +177,8 @@ const plugin = {
           rootSpan,
           llmSpan,
           toolSpans: new Map(),
+          toolSpanKeysByName: new Map(),
+          toolSpanSeq: 0,
           subagentSpans: new Map(), // Reserved for future subagent hook support
           startedAt: now,
           lastActivityAt: now,
@@ -139,6 +188,7 @@ const plugin = {
           provider: normalizedProvider,
           channelId,
           trigger: resolveTrigger(agentCtx as Record<string, unknown>),
+          prompt: userPrompt,
           agentId: asNonEmptyString(agentCtx.agentId),
           userId,
           completedToolCallIds: new Set(),
@@ -230,8 +280,18 @@ const plugin = {
         const toolCallId = event.toolCallId ?? toolCtx.toolCallId;
         const spanKey = toolCallId
           ? `toolcall:${toolCallId}`
-          : `${event.toolName}:${Date.now()}`;
+          : `${event.toolName}:${++active.toolSpanSeq}`;
+
+        if (toolCallId) {
+          const id = String(toolCallId);
+          toolSpan.setAttribute("tool.id", id);
+          toolSpan.setAttribute("tool_call.id", id);
+        }
+
         active.toolSpans.set(spanKey, toolSpan);
+        const queue = active.toolSpanKeysByName.get(event.toolName) ?? [];
+        queue.push(spanKey);
+        active.toolSpanKeysByName.set(event.toolName, queue);
       } catch (err) {
         console.warn(`[phoenix-otel] tool span creation failed: ${formatError(err)}`);
       }
@@ -256,12 +316,17 @@ const plugin = {
         if (matchedSpan) matchedKey = key;
       }
       if (!matchedSpan) {
-        for (const [key, span] of active.toolSpans) {
-          if (key.startsWith(`${event.toolName}:`)) {
-            matchedKey = key;
-            matchedSpan = span;
-            break;
-          }
+        const queue = active.toolSpanKeysByName.get(event.toolName);
+        while (queue && queue.length > 0 && !matchedSpan) {
+          const key = queue.shift();
+          if (!key) continue;
+          const span = active.toolSpans.get(key);
+          if (!span) continue;
+          matchedKey = key;
+          matchedSpan = span;
+        }
+        if (queue && queue.length === 0) {
+          active.toolSpanKeysByName.delete(event.toolName);
         }
       }
       if (!matchedKey || !matchedSpan) return;
@@ -278,6 +343,14 @@ const plugin = {
 
       matchedSpan.end();
       active.toolSpans.delete(matchedKey);
+      if (toolCallId) {
+        const queue = active.toolSpanKeysByName.get(event.toolName);
+        if (queue && queue.length > 0) {
+          const idx = queue.indexOf(matchedKey);
+          if (idx >= 0) queue.splice(idx, 1);
+          if (queue.length === 0) active.toolSpanKeysByName.delete(event.toolName);
+        }
+      }
       if (toolCallId) active.completedToolCallIds.add(String(toolCallId));
     });
 
@@ -293,6 +366,7 @@ const plugin = {
       // End orphaned spans
       for (const [, s] of active.toolSpans) { try { s.end(); } catch {} }
       active.toolSpans.clear();
+      active.toolSpanKeysByName.clear();
       for (const [, s] of active.subagentSpans) { try { s.end(); } catch {} }
       active.subagentSpans.clear();
       if (active.llmSpan) { try { active.llmSpan.end(); } catch {} active.llmSpan = null; }
@@ -358,7 +432,9 @@ const plugin = {
         // Convert those message-level tool calls into first-class TOOL spans so
         // Phoenix renders them in the trace tree instead of burying them in one
         // scrollable chat transcript.
-        for (const call of extractToolCallsFromMessages(event.messages)) {
+        const scopedMessages = scopeMessagesToCurrentTurn(event.messages, current.prompt);
+        let postHocToolIndex = 0;
+        for (const call of extractToolCallsFromMessages(scopedMessages)) {
           if (call.id && current.completedToolCallIds.has(call.id)) continue;
           try {
             const attrs: Record<string, string | number | boolean> = {
@@ -375,7 +451,14 @@ const plugin = {
             if (call.arguments !== undefined) {
               attrs["tool_call.function.arguments"] = safeStringify(sanitizeValue(call.arguments));
             }
-            const span = startChildSpan(current.rootSpan, call.name, { attributes: attrs });
+            const span = startChildSpan(current.rootSpan, call.name, {
+              attributes: attrs,
+              // These are reconstructed after agent_end, so there is no true
+              // per-tool wall-clock timestamp.  Give Phoenix stable monotonic
+              // start times so sorting preserves transcript order instead of
+              // reversing same-millisecond spans nondeterministically.
+              startTime: new Date(current.startedAt + 1_000 + postHocToolIndex++),
+            });
             if (call.error) {
               span.setAttribute("output.value", safeStringify({ error: sanitizeString(call.error) }));
               span.setAttribute("output.mime_type", "application/json");

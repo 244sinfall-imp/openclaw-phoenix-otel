@@ -45,6 +45,8 @@ export type ActiveTrace = {
   rootSpan: Span;
   llmSpan: Span | null;
   toolSpans: Map<string, Span>;
+  toolSpanKeysByName: Map<string, string[]>;
+  toolSpanSeq: number;
   completedToolCallIds: Set<string>;
   subagentSpans: Map<string, Span>;
   startedAt: number;
@@ -73,6 +75,7 @@ export type ActiveTrace = {
   provider?: string;
   channelId?: string;
   trigger?: string;
+  prompt?: string;
   output?: { output: string; lastAssistant?: unknown };
   agentEnd?: {
     success: boolean;

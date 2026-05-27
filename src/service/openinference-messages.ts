@@ -179,7 +179,8 @@ export function extractToolCallsFromMessages(messages: unknown): ExtractedToolCa
   if (!Array.isArray(messages)) return [];
 
   const resultsById = new Map<string, { id?: string; name?: string; result?: unknown; error?: string }>();
-  const looseResults: Array<{ id?: string; name?: string; result?: unknown; error?: string }> = [];
+  const looseResultsByName = new Map<string, Array<{ id?: string; name?: string; result?: unknown; error?: string }>>();
+  const looseResultsAny: Array<{ id?: string; name?: string; result?: unknown; error?: string }> = [];
 
   for (const raw of messages) {
     const message = asRecord(raw);
@@ -187,7 +188,14 @@ export function extractToolCallsFromMessages(messages: unknown): ExtractedToolCa
     const result = extractToolResultFromMessage(message);
     if (!result) continue;
     if (result.id) resultsById.set(result.id, result);
-    else looseResults.push(result);
+    else {
+      looseResultsAny.push(result);
+      if (result.name) {
+        const queue = looseResultsByName.get(result.name) ?? [];
+        queue.push(result);
+        looseResultsByName.set(result.name, queue);
+      }
+    }
   }
 
   const calls: ExtractedToolCall[] = [];
@@ -195,7 +203,24 @@ export function extractToolCallsFromMessages(messages: unknown): ExtractedToolCa
     const message = asRecord(raw);
     if (!message) continue;
     for (const call of extractToolCallsFromMessage(message)) {
-      const result = call.id ? resultsById.get(call.id) : looseResults.find((item) => item.name === call.name);
+      let result = call.id ? resultsById.get(call.id) : undefined;
+
+      if (!result) {
+        const byNameQueue = looseResultsByName.get(call.name);
+        if (byNameQueue && byNameQueue.length > 0) {
+          result = byNameQueue.shift();
+          if (byNameQueue.length === 0) looseResultsByName.delete(call.name);
+          if (result) {
+            const idx = looseResultsAny.indexOf(result);
+            if (idx >= 0) looseResultsAny.splice(idx, 1);
+          }
+        }
+      }
+
+      if (!result && looseResultsAny.length > 0) {
+        result = looseResultsAny.shift();
+      }
+
       calls.push({
         ...call,
         ...(result?.result !== undefined ? { result: result.result } : {}),

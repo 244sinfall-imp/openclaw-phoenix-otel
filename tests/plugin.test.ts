@@ -153,6 +153,9 @@ describe("llm_input handler", () => {
     expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith(
       "llm.input_messages.1.message.role", "user",
     );
+    expect(mockLlmSpan.setAttribute).not.toHaveBeenCalledWith(
+      "llm.input_messages.2.message.role", expect.anything(),
+    );
   });
 
   it("sets user.id when senderId present", async () => {
@@ -181,7 +184,7 @@ describe("llm_input handler", () => {
     );
   });
 
-  it("exports tool-call messages using OpenInference tool_call attributes", async () => {
+  it("does not export history tool-call messages inside the LLM span", async () => {
     const { default: plugin } = await import("../index.js");
     const api = buildMockApi();
     plugin.register(api as any);
@@ -201,19 +204,16 @@ describe("llm_input handler", () => {
       ],
     }, makeAgentCtx());
 
-    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.0.message.role", "assistant");
-    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith(
-      "llm.input_messages.0.message.tool_calls.0.tool_call.id", "call-1",
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.0.message.role", "user");
+    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.0.message.content", "continue");
+    expect(mockLlmSpan.setAttribute).not.toHaveBeenCalledWith(
+      expect.stringContaining("tool_calls"),
+      expect.anything(),
     );
-    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith(
-      "llm.input_messages.0.message.tool_calls.0.tool_call.function.name", "exec",
+    expect(mockLlmSpan.setAttribute).not.toHaveBeenCalledWith(
+      expect.stringContaining("tool_call_id"),
+      expect.anything(),
     );
-    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith(
-      "llm.input_messages.0.message.tool_calls.0.tool_call.function.arguments", '{"command":"pwd"}',
-    );
-    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.1.message.role", "tool");
-    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.1.message.tool_call_id", "call-1");
-    expect(mockLlmSpan.setAttribute).toHaveBeenCalledWith("llm.input_messages.1.message.content", "/repo");
   });
 
   it("closes existing trace for session before starting new one", async () => {
@@ -361,6 +361,27 @@ describe("tool call handlers", () => {
 
     expect(mockToolSpan.end).toHaveBeenCalled();
   });
+
+  it("does not lose tool spans when multiple no-id calls happen in the same millisecond", async () => {
+    const { default: plugin } = await import("../index.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1710000000000);
+    try {
+      const ctx = makeAgentCtx();
+      api.emit("llm_input", { model: "m", prompt: "hi" }, ctx);
+      api.emit("before_tool_call", { toolName: "read", params: { path: "a" } }, ctx);
+      api.emit("before_tool_call", { toolName: "read", params: { path: "b" } }, ctx);
+
+      api.emit("after_tool_call", { toolName: "read", result: "a" }, ctx);
+      api.emit("after_tool_call", { toolName: "read", result: "b" }, ctx);
+
+      expect(mockToolSpan.end).toHaveBeenCalledTimes(2);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
 });
 
 describe("agent_end handler", () => {
@@ -497,6 +518,34 @@ describe("agent_end handler", () => {
     );
     expect(mockToolSpan.setAttribute).toHaveBeenCalledWith("output.value", "# README");
     expect(mockToolSpan.end).toHaveBeenCalled();
+  });
+
+  it("scopes post-hoc TOOL extraction to current turn to avoid old 0ms calls", async () => {
+    const { default: plugin } = await import("../index.js");
+    const { startChildSpan } = await import("../src/service/otel-bridge.js");
+    const api = buildMockApi();
+    plugin.register(api as any);
+
+    const ctx = makeAgentCtx();
+    api.emit("llm_input", { model: "m", prompt: "new prompt" }, ctx);
+    api.emit("agent_end", {
+      messages: [
+        { role: "user", content: "old prompt" },
+        { role: "assistant", content: [{ type: "toolCall", id: "old-1", name: "read", arguments: { path: "OLD.md" } }] },
+        { role: "toolResult", content: [{ type: "toolResult", toolUseId: "old-1", content: "old result" }] },
+        { role: "user", content: "new prompt" },
+        { role: "assistant", content: [{ type: "toolCall", id: "new-1", name: "write", arguments: { path: "NEW.md" } }] },
+        { role: "toolResult", content: [{ type: "toolResult", toolUseId: "new-1", content: "new result" }] },
+      ],
+    }, ctx);
+    await flushMicrotasks();
+
+    const calls = (startChildSpan as any).mock.calls
+      .map((c: any[]) => c[1])
+      .filter((name: string) => name !== "m"); // exclude first LLM child span
+
+    expect(calls).toContain("write");
+    expect(calls).not.toContain("read");
   });
 
   it("is a no-op for unknown session", async () => {
